@@ -1,0 +1,5 @@
+{
+  "server_url": "http://127.0.0.1:8000",
+  "device_name": "Office workstation",
+  "listen": "127.0.0.1:8765"
+}
