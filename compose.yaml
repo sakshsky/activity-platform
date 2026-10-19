@@ -1,0 +1,56 @@
+name: activity-platform
+x-app: &application
+  image: activity-platform-php
+  build:
+    context: .
+    dockerfile: deploy/Dockerfile
+    target: runtime
+  env_file: .env
+  environment:
+    DB_CONNECTION: mysql
+    DB_HOST: db
+    DB_PORT: 3306
+  volumes:
+    - private-data:/var/www/html/storage
+  depends_on:
+    db:
+      condition: service_healthy
+  restart: unless-stopped
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: ${DB_DATABASE:?Set DB_DATABASE}
+      MYSQL_USER: ${DB_USERNAME:?Set DB_USERNAME}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?Set DB_ROOT_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: [CMD-SHELL, 'mysqladmin ping -h localhost -u root -p"$$MYSQL_ROOT_PASSWORD" --silent']
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+  app:
+    <<: *application
+  worker:
+    <<: *application
+    user: www-data
+    command: [php, artisan, queue:work, --sleep=3, --tries=3, --timeout=120]
+  scheduler:
+    <<: *application
+    user: www-data
+    command: [php, artisan, schedule:work]
+  web:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: web
+    ports:
+      - '127.0.0.1:8080:80'
+    depends_on: [app]
+    restart: unless-stopped
+volumes:
+  mysql-data:
+  private-data:
