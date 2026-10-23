@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -68,7 +69,7 @@ func (c *Client) send(req *http.Request, token string, output any) error {
 		return &APIError{response.StatusCode, body.Message}
 	}
 	if output != nil {
-		if err := json.NewDecoder(io.LimitReader(response.Body, 1024*1024)).Decode(output); err != nil {
+		if err := json.NewDecoder(io.LimitReader(response.Body, 16*1024*1024)).Decode(output); err != nil {
 			return errors.New("server confirmation could not be read; record retained")
 		}
 	}
@@ -94,10 +95,30 @@ func (c *Client) upload(ctx context.Context, token, root string, job Job) error 
 			return err
 		}
 	}
+	if job.CaptureState != "" {
+		fields := map[string]string{"capture_state": job.CaptureState, "idle_threshold_seconds": strconv.Itoa(captureThreshold(job)), "agent_version": job.AgentVersion}
+		if job.IdleSeconds != nil {
+			fields["idle_seconds"] = strconv.FormatUint(uint64(*job.IdleSeconds), 10)
+		}
+		for key, value := range fields {
+			if err := writer.WriteField(key, value); err != nil {
+				return err
+			}
+		}
+	}
+	if job.Kind == "video" {
+		if err := writer.WriteField("notice_version", strconv.Itoa(job.NoticeVersion)); err != nil {
+			return err
+		}
+	}
 	if err := writer.Close(); err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", c.base+"/api/agent/screenshots", &buffer)
+	endpoint := "/api/agent/screenshots"
+	if job.Kind == "video" {
+		endpoint = "/api/agent/videos"
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", c.base+endpoint, &buffer)
 	if err != nil {
 		return err
 	}
@@ -105,11 +126,21 @@ func (c *Client) upload(ctx context.Context, token, root string, job Job) error 
 	var result struct {
 		Accepted bool `json:"accepted"`
 	}
-	if err := c.send(req, token, &result); err != nil {
+	uploadClient := *c.http
+	uploadClient.Timeout = 120 * time.Second
+	uploader := &Client{base: c.base, http: &uploadClient}
+	if err := uploader.send(req, token, &result); err != nil {
 		return err
 	}
 	if !result.Accepted {
 		return errors.New("server did not acknowledge screenshot")
 	}
 	return nil
+}
+
+func captureThreshold(job Job) int {
+	if job.IdleThresholdSeconds > 0 {
+		return job.IdleThresholdSeconds
+	}
+	return idleThresholdSeconds
 }

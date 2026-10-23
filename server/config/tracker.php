@@ -7,4 +7,5 @@ return [
     'ftps_password' => env('TRACKER_FTPS_PASSWORD'),
     'curl_binary' => env('TRACKER_CURL_BINARY', PHP_OS_FAMILY === 'Windows' ? 'curl.exe' : 'curl'),
     'token_days' => 30,
+    'ffprobe_binary' => env('TRACKER_FFPROBE_BINARY', 'ffprobe'),
 ];

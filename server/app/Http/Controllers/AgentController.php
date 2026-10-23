@@ -8,6 +8,7 @@ use App\Models\Device;
 use App\Models\MonitoringPolicy;
 use App\Models\Screenshot;
 use App\Models\User;
+use App\Services\Attendance;
 use App\Services\Audit;
 use App\Services\Vault;
 use Carbon\CarbonImmutable;
@@ -43,7 +44,8 @@ class AgentController extends Controller
             }
             $expiry = now()->addDays(config('tracker.token_days'));
             $token = $user->createToken('device:'.$data['device_identifier'], ['device:collect'], $expiry);
-            $device->fill(['name' => $data['device_name'], 'os' => $data['os'], 'token_id' => $token->accessToken->id, 'last_seen_at' => now(), 'notice_version' => $policy->version, 'notice_accepted_at' => now()])->save();
+            $device->fill(['name' => $data['device_name'], 'os' => $data['os'], 'token_id' => $token->accessToken->id, 'last_seen_at' => now(), 'notice_version' => $policy->version, 'notice_accepted_at' => now(), 'modules_notice_version' => null, 'modules_accepted_at' => null])->save();
+            Attendance::begin($device, $policy->monitoring_enabled && ! $device->paused);
 
             return ['user' => $user, 'device' => $device, 'token' => $token->plainTextToken, 'expires_at' => $expiry, 'policy' => $this->policyFor($device, $policy)];
         });
@@ -54,17 +56,28 @@ class AgentController extends Controller
 
     public function heartbeat(Request $request): JsonResponse
     {
-        $device = $request->attributes->get('device');
-        $device->update(['last_seen_at' => now()]);
+        $request->validate(['idle_seconds' => 'sometimes|integer|min:0|max:4294967295', 'activity_state' => 'sometimes|required|in:active,idle,unavailable']);
+        $device = DB::transaction(function () use ($request): Device {
+            $device = $this->lockedDevice($request);
+            Attendance::beat($device, MonitoringPolicy::current()->monitoring_enabled && ! $device->paused, $request->input('activity_state', 'legacy'));
+            $device->update(['last_seen_at' => now(), 'idle_seconds' => $request->input('idle_seconds')]);
+
+            return $device;
+        });
 
         return response()->json(['device' => $device, 'policy' => $this->policyFor($device)]);
     }
 
     public function logout(Request $request): JsonResponse
     {
-        $device = $request->attributes->get('device');
-        $request->user()->currentAccessToken()->delete();
-        $device->update(['token_id' => null]);
+        $device = DB::transaction(function () use ($request): Device {
+            $device = $this->lockedDevice($request);
+            $request->user()->currentAccessToken()->delete();
+            Attendance::close($device, 'signed_out');
+            $device->update(['token_id' => null]);
+
+            return $device;
+        });
         Audit::record($request, 'device.logout', 'device', $device->id);
 
         return response()->json(['success' => true]);
@@ -72,10 +85,10 @@ class AgentController extends Controller
 
     public function screenshot(Request $request, Vault $vault): JsonResponse
     {
-        $data = $request->validate(['event_id' => 'required|uuid', 'captured_at' => 'required|date|before_or_equal:'.now()->addMinutes(5)->toIso8601String(), 'file' => 'required|file|mimetypes:image/png|max:20480', 'app_name' => 'nullable|string|max:160', 'window_title' => 'nullable|string|max:1000', 'url' => 'nullable|string|max:2048']);
+        $data = $request->validate(['event_id' => 'required|uuid', 'captured_at' => 'required|date|before_or_equal:'.now()->addMinutes(5)->toIso8601String(), 'file' => 'required|file|mimetypes:image/png|max:20480', 'app_name' => 'nullable|string|max:160', 'window_title' => 'nullable|string|max:1000', 'url' => 'nullable|string|max:2048', 'capture_state' => 'nullable|in:active,idle,unavailable', 'idle_seconds' => 'nullable|integer|min:0|max:4294967295', 'idle_threshold_seconds' => 'nullable|integer|min:1|max:86400', 'agent_version' => 'nullable|string|max:40']);
         $device = $request->attributes->get('device');
         $policy = MonitoringPolicy::current();
-        abort_if($device->paused || ! $policy->monitoring_enabled, 409, 'Monitoring is paused by the administrator.');
+        abort_if($device->paused || ! $policy->monitoring_enabled, 409, 'Capture is paused by the administrator.');
         $captured = CarbonImmutable::parse($data['captured_at'])->utc();
         if ($captured->lessThan(now()->subDays($policy->retention_days))) {
             return response()->json(['accepted' => true, 'discarded' => true]);
@@ -86,8 +99,13 @@ class AgentController extends Controller
         abort_unless($size && $size[0] * $size[1] <= 64000000, 422, 'Screenshot dimensions are too large.');
         $sha = hash_file('sha256', $file->getRealPath());
         $created = false;
-        $shot = DB::transaction(function () use ($device, $data, $policy, $captured, $file, $sha, $vault, &$created): Screenshot {
-            Device::whereKey($device->id)->lockForUpdate()->firstOrFail();
+        $shot = DB::transaction(function () use ($request, $data, $captured, $file, $sha, $size, $vault, &$created): ?Screenshot {
+            $device = $this->lockedDevice($request);
+            $policy = MonitoringPolicy::current();
+            abort_if($device->paused || ! $policy->monitoring_enabled, 409, 'Capture is paused by the administrator.');
+            if ($captured->lessThan(now()->subDays($policy->retention_days))) {
+                return null;
+            }
             $existing = Screenshot::where('device_id', $device->id)->where('event_id', $data['event_id'])->first();
             if ($existing) {
                 abort_unless(hash_equals($existing->sha256, $sha), 409, 'This event ID already belongs to a different screenshot.');
@@ -97,7 +115,7 @@ class AgentController extends Controller
             $path = 'screenshots/'.$device->device_identifier.'/'.$captured->format('Y-m-d').'/'.$data['event_id'].'.png';
             $vault->put($path, file_get_contents($file->getRealPath()));
             try {
-                $shot = Screenshot::create(['device_id' => $device->id, 'event_id' => $data['event_id'], 'captured_at' => $captured, 'path' => $path, 'storage' => config('tracker.storage'), 'sha256' => $sha, 'bytes' => $file->getSize(), 'app_name' => $data['app_name'] ?? '', 'window_title' => $data['window_title'] ?? '', 'url' => $policy->browser_urls ? $this->cleanURL($data['url'] ?? '') : null]);
+                $shot = Screenshot::create(['device_id' => $device->id, 'event_id' => $data['event_id'], 'captured_at' => $captured, 'path' => $path, 'storage' => config('tracker.storage'), 'sha256' => $sha, 'width' => $size[0], 'height' => $size[1], 'capture_state' => $data['capture_state'] ?? null, 'idle_seconds' => $data['idle_seconds'] ?? null, 'idle_threshold_seconds' => $data['idle_threshold_seconds'] ?? null, 'agent_version' => $data['agent_version'] ?? null, 'bytes' => $file->getSize(), 'app_name' => $data['app_name'] ?? '', 'window_title' => $data['window_title'] ?? '', 'url' => $policy->browser_urls ? $this->cleanURL($data['url'] ?? '') : null]);
                 $device->update(['last_upload_at' => now(), 'last_seen_at' => now()]);
                 $created = true;
 
@@ -107,7 +125,10 @@ class AgentController extends Controller
                 throw $error;
             }
         });
-        if ($created) {
+        if (! $shot) {
+            return response()->json(['accepted' => true, 'discarded' => true]);
+        }
+        if (! $shot->thumbnail_path) {
             GenerateThumbnail::dispatch($shot->id);
         }
 
@@ -116,20 +137,22 @@ class AgentController extends Controller
 
     public function activity(Request $request): JsonResponse
     {
-        $data = $request->validate(['events' => 'required|array|min:1|max:100', 'events.*.event_id' => 'required|uuid', 'events.*.captured_at' => 'required|date|before_or_equal:'.now()->addMinutes(5)->toIso8601String(), 'events.*.app_name' => 'required|string|max:160', 'events.*.window_title' => 'nullable|string|max:1000', 'events.*.url' => 'nullable|string|max:2048']);
+        $data = $request->validate(['events' => 'required|array|min:1|max:100', 'events.*.event_id' => 'required|uuid', 'events.*.captured_at' => 'required|date|before_or_equal:'.now()->addMinutes(5)->toIso8601String(), 'events.*.app_name' => 'required|string|max:160', 'events.*.window_title' => 'nullable|string|max:1000', 'events.*.url' => 'nullable|string|max:2048', 'events.*.duration_seconds' => 'sometimes|integer|min:0|max:600', 'events.*.sample_interval_seconds' => 'required_with:events.*.duration_seconds|integer|min:5|max:300', 'events.*.app_switches' => 'sometimes|integer|min:0|max:1']);
         $device = $request->attributes->get('device');
         $policy = MonitoringPolicy::current();
-        abort_if($device->paused || ! $policy->monitoring_enabled, 409, 'Monitoring is paused by the administrator.');
+        abort_if($device->paused || ! $policy->monitoring_enabled, 409, 'Capture is paused by the administrator.');
         $accepted = [];
-        DB::transaction(function () use ($data, $device, $policy, &$accepted): void {
-            Device::whereKey($device->id)->lockForUpdate()->firstOrFail();
+        DB::transaction(function () use ($request, $data, &$accepted): void {
+            $device = $this->lockedDevice($request);
+            $policy = MonitoringPolicy::current();
+            abort_if($device->paused || ! $policy->monitoring_enabled, 409, 'Capture is paused by the administrator.');
             foreach ($data['events'] as $event) {
                 $accepted[] = $event['event_id'];
                 $captured = CarbonImmutable::parse($event['captured_at'])->utc();
                 if ($captured->lessThan(now()->subDays($policy->retention_days))) {
                     continue;
                 }
-                ActivityLog::firstOrCreate(['device_id' => $device->id, 'event_id' => $event['event_id']], ['captured_at' => $captured, 'app_name' => $event['app_name'], 'window_title' => $event['window_title'] ?? '', 'url' => $policy->browser_urls ? $this->cleanURL($event['url'] ?? '') : null, 'created_at' => now()]);
+                ActivityLog::firstOrCreate(['device_id' => $device->id, 'event_id' => $event['event_id']], ['captured_at' => $captured, 'app_name' => $event['app_name'], 'window_title' => $event['window_title'] ?? '', 'url' => $policy->browser_urls ? $this->cleanURL($event['url'] ?? '') : null, 'duration_seconds' => isset($event['sample_interval_seconds']) ? min($event['duration_seconds'] ?? 0, 2 * $event['sample_interval_seconds']) : null, 'app_switches' => $event['app_switches'] ?? null, 'created_at' => now()]);
             }
             $device->update(['last_seen_at' => now(), 'last_upload_at' => now()]);
         });
@@ -137,11 +160,24 @@ class AgentController extends Controller
         return response()->json(['accepted_ids' => $accepted]);
     }
 
+    public function lockedDevice(Request $request): Device
+    {
+        // Match enrollment/disable lock order and recheck access after acquiring the locks.
+        $user = User::whereKey($request->user()->id)->lockForUpdate()->firstOrFail();
+        $device = Device::whereKey($request->attributes->get('device')->id)->lockForUpdate()->firstOrFail();
+        $token = $request->user()->currentAccessToken();
+        abort_unless($user->enabled && $user->role === 'employee' && ! $device->disabled_at
+            && $device->user_id === $user->id && (string) $device->token_id === (string) $token->id
+            && (! $token->expires_at || $token->expires_at->isFuture()), 403, 'Device access revoked.');
+
+        return $device;
+    }
+
     private function policyFor(Device $device, ?MonitoringPolicy $policy = null): array
     {
         $policy ??= MonitoringPolicy::current();
 
-        return [...$policy->toArray(), 'monitoring_enabled' => $policy->monitoring_enabled && ! $device->paused, 'paused' => $device->paused];
+        return [...$policy->toArray(), 'monitoring_enabled' => $policy->monitoring_enabled && ! $device->paused, 'paused' => $device->paused, 'modules_consented' => (int) $device->modules_notice_version === (int) $policy->version];
     }
 
     private function cleanURL(string $value): ?string

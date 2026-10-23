@@ -4,4 +4,4 @@ package main
 
 import "context"
 
-func runTray(ctx context.Context, address string, tracking func() bool) {}
+func runTray(ctx context.Context, address string, tracking func() string) {}

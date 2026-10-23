@@ -8,7 +8,7 @@ RUN npm run build
 FROM php:8.4-fpm-bookworm AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends curl unzip libzip-dev libpng-dev libjpeg62-turbo-dev libfreetype6-dev libicu-dev libonig-dev \
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
-    && docker-php-ext-install pdo_mysql mbstring gd zip intl pcntl \
+    && docker-php-ext-install pdo_mysql mbstring gd zip intl pcntl ftp \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 WORKDIR /var/www/html

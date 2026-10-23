@@ -20,20 +20,41 @@ type User struct {
 	Email string `json:"email"`
 }
 type Policy struct {
-	Version           int    `json:"version"`
-	MonitoringEnabled bool   `json:"monitoring_enabled"`
-	ScreenshotSeconds int    `json:"screenshot_interval_seconds"`
-	ActivitySeconds   int    `json:"activity_interval_seconds"`
-	BrowserURLs       bool   `json:"browser_urls"`
-	QueueMB           int    `json:"offline_queue_max_mb"`
-	OfflineDays       int    `json:"offline_retention_days"`
-	Notice            string `json:"notice"`
+	VideoEnabled     bool   `json:"video_enabled"`
+	AnomalyEnabled   bool   `json:"anomaly_enabled"`
+	ModulesConsented bool   `json:"modules_consented"`
+	ModulesNotice    string `json:"modules_notice"`
+	VideoInterval    int    `json:"video_interval_seconds"`
+	VideoSeconds     int    `json:"video_clip_seconds"`
+
+	IdleThresholdSeconds int    `json:"idle_threshold_seconds"`
+	IdleAlertMinutes     int    `json:"idle_alert_minutes"`
+	Version              int    `json:"version"`
+	MonitoringEnabled    bool   `json:"monitoring_enabled"`
+	ScreenshotSeconds    int    `json:"screenshot_interval_seconds"`
+	ActivitySeconds      int    `json:"activity_interval_seconds"`
+	BrowserURLs          bool   `json:"browser_urls"`
+	QueueMB              int    `json:"offline_queue_max_mb"`
+	OfflineDays          int    `json:"offline_retention_days"`
+	Notice               string `json:"notice"`
 }
 
 func defaultPolicy() Policy {
-	return Policy{ScreenshotSeconds: 120, ActivitySeconds: 5, QueueMB: 512, OfflineDays: 7, Notice: "This agent records desktop screenshots and foreground application activity while signed in, under your organization's monitoring policy. Contact the server to load the current notice before signing in."}
+	return Policy{IdleThresholdSeconds: 300, IdleAlertMinutes: 10, ScreenshotSeconds: 120, ActivitySeconds: 5, QueueMB: 512, OfflineDays: 7, Notice: "This agent records desktop screenshots and foreground application activity while signed in, under your organization's capture policy. Contact the server to load the current notice before signing in."}
 }
 func (p Policy) bounded() Policy {
+	if p.VideoInterval < 60 || p.VideoInterval > 3600 {
+		p.VideoInterval = 300
+	}
+	if p.VideoSeconds < 5 || p.VideoSeconds > 30 {
+		p.VideoSeconds = 10
+	}
+	if p.IdleThresholdSeconds < 30 || p.IdleThresholdSeconds > 600 {
+		p.IdleThresholdSeconds = 300
+	}
+	if p.IdleAlertMinutes < 0 || p.IdleAlertMinutes > 120 {
+		p.IdleAlertMinutes = 10
+	}
 	if p.ScreenshotSeconds < 30 || p.ScreenshotSeconds > 3600 {
 		p.ScreenshotSeconds = 120
 	}
@@ -66,27 +87,37 @@ type Session struct {
 	Policy Policy `json:"policy"`
 }
 type Activity struct {
+	WindowID  uintptr
 	App       string
 	Title     string
 	URL       string
 	URLStatus string
 }
 type Event struct {
-	ID         string    `json:"event_id"`
-	CapturedAt time.Time `json:"captured_at"`
-	App        string    `json:"app_name"`
-	Title      string    `json:"window_title"`
-	URL        string    `json:"url,omitempty"`
+	DurationSeconds       int       `json:"duration_seconds,omitempty"`
+	SampleIntervalSeconds int       `json:"sample_interval_seconds,omitempty"`
+	AppSwitches           *int      `json:"app_switches,omitempty"`
+	ID                    string    `json:"event_id"`
+	CapturedAt            time.Time `json:"captured_at"`
+	App                   string    `json:"app_name"`
+	Title                 string    `json:"window_title"`
+	URL                   string    `json:"url,omitempty"`
 }
 type Job struct {
+	NoticeVersion int              `json:"notice_version,omitempty"`
+	Anomaly       *AnomalyEvidence `json:"anomaly,omitempty"`
 	Event
-	Kind        string    `json:"kind"`
-	File        string    `json:"file,omitempty"`
-	UserID      string    `json:"user_id"`
-	Attempts    int       `json:"attempts"`
-	NextAttempt time.Time `json:"next_attempt"`
-	Bytes       int64     `json:"bytes"`
-	Failure     string    `json:"failure,omitempty"`
+	IdleThresholdSeconds int       `json:"idle_threshold_seconds,omitempty"`
+	CaptureState         string    `json:"capture_state,omitempty"`
+	IdleSeconds          *uint32   `json:"idle_seconds,omitempty"`
+	AgentVersion         string    `json:"agent_version,omitempty"`
+	Kind                 string    `json:"kind"`
+	File                 string    `json:"file,omitempty"`
+	UserID               string    `json:"user_id"`
+	Attempts             int       `json:"attempts"`
+	NextAttempt          time.Time `json:"next_attempt"`
+	Bytes                int64     `json:"bytes"`
+	Failure              string    `json:"failure,omitempty"`
 }
 
 func uuid() string {

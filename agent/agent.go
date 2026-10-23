@@ -14,8 +14,13 @@ import (
 )
 
 type Agent struct {
+	videoMu        sync.Mutex
+	videoRecording bool
+	videoMessage   string
 	sync.Mutex
 	transition                             sync.Mutex
+	workers                                sync.WaitGroup
+	configPath                             string
 	logMu                                  sync.Mutex
 	config                                 Config
 	root, id                               string
@@ -24,6 +29,7 @@ type Agent struct {
 	session                                *Session
 	cancel                                 context.CancelFunc
 	tracking                               bool
+	preview                                *ScreenshotPreview
 	lastContact                            time.Time
 	policy                                 Policy
 	message, uploadMessage, captureMessage string
@@ -44,7 +50,7 @@ func newAgent(config Config, root string) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &Agent{config: config, root: root, id: id, queue: queue, client: newClient(config.ServerURL), policy: defaultPolicy(), message: "Sign in to enroll this device.", uploadMessage: "No uploads yet.", captureMessage: "Monitoring is stopped."}
+	a := &Agent{config: config, root: root, id: id, queue: queue, client: newClient(config.ServerURL), policy: defaultPolicy(), message: "Sign in to enroll this device.", uploadMessage: "No uploads yet.", captureMessage: "Capture is stopped."}
 	if sealed, err := os.ReadFile(filepath.Join(root, "session.bin")); err == nil {
 		if plain, err := protectSettings(sealed, false); err == nil {
 			var session Session
@@ -72,18 +78,24 @@ func (a *Agent) useSession(session Session) {
 		a.cancel = nil
 	}
 	a.session = &session
+	if a.preview != nil && a.preview.UserID != session.User.ID {
+		a.preview = nil
+	}
 	a.policy = session.Policy
 	a.tracking = session.Policy.MonitoringEnabled && session.ExpiresAt.After(time.Now())
-	a.message = "Monitoring follows your organization's policy."
+	a.message = "Capture follows your organization's policy."
 	if a.tracking {
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithDeadline(context.Background(), session.ExpiresAt)
 		a.cancel = cancel
-		a.message = "Monitoring active. Screenshots and app activity are collected and uploaded."
-		go a.capture(ctx, session)
-		go a.activity(ctx, session)
-		go a.uploads(ctx, session)
+		a.message = "Capture active. Screenshots and app activity are collected and uploaded."
+		a.workers.Add(5)
+		go func() { defer a.workers.Done(); a.recordVideos(ctx, session) }()
+		go func() { defer a.workers.Done(); a.observeTiming(ctx, session) }()
+		go func() { defer a.workers.Done(); a.capture(ctx, session) }()
+		go func() { defer a.workers.Done(); a.activity(ctx, session) }()
+		go func() { defer a.workers.Done(); a.uploads(ctx, session) }()
 	} else {
-		a.message = "Monitoring paused by the administrator."
+		a.message = "Capture paused by the administrator."
 		a.captureMessage = "Capture is paused."
 	}
 	message := a.message
@@ -106,7 +118,7 @@ func (a *Agent) login(ctx context.Context, email, password string, accepted bool
 	a.transition.Lock()
 	defer a.transition.Unlock()
 	if !accepted {
-		return errors.New("read and accept the monitoring notice first")
+		return errors.New("read and accept the capture notice first")
 	}
 	var session Session
 	err := a.client.request(ctx, "/api/agent/login", "", map[string]any{"email": email, "password": password, "device_identifier": a.id, "device_name": a.config.DeviceName, "os": "windows", "notice_accepted": true}, &session)
@@ -122,6 +134,7 @@ func (a *Agent) login(ctx context.Context, email, password string, accepted bool
 	a.lastContact = time.Now()
 	a.Unlock()
 	if err := a.persist(session); err != nil {
+		os.Remove(filepath.Join(a.root, "session.bin"))
 		a.Lock()
 		a.message += " Credentials could not be saved by Windows; sign in again after restarting."
 		a.Unlock()
@@ -136,10 +149,12 @@ func (a *Agent) stopSession(message string) {
 		a.cancel = nil
 	}
 	a.session = nil
+	a.preview = nil
 	a.tracking = false
 	a.message = message
-	a.captureMessage = "Monitoring is stopped."
+	a.captureMessage = "Capture is stopped."
 	a.Unlock()
+	a.workers.Wait()
 	os.Remove(filepath.Join(a.root, "session.bin"))
 	a.localLog("session.stopped", "", message)
 }
@@ -176,6 +191,9 @@ func (a *Agent) refresh(parent context.Context) {
 	defer cancel()
 	session := a.sessionCopy()
 	if session == nil {
+		if a.config.ServerURL == "" {
+			return
+		}
 		var info struct {
 			Policy Policy `json:"policy"`
 		}
@@ -196,7 +214,7 @@ func (a *Agent) refresh(parent context.Context) {
 	var result struct {
 		Policy Policy `json:"policy"`
 	}
-	if err := a.client.request(ctx, "/api/agent/heartbeat", session.Token, map[string]any{}, &result); err != nil {
+	if err := a.client.request(ctx, "/api/agent/heartbeat", session.Token, map[string]any{"activity_state": presenceFor(session.Policy).State, "idle_seconds": presenceFor(session.Policy).IdleSeconds}, &result); err != nil {
 		current := a.sessionCopy()
 		if current == nil || current.Token != session.Token {
 			return
@@ -207,7 +225,7 @@ func (a *Agent) refresh(parent context.Context) {
 			return
 		}
 		a.Lock()
-		a.message = "Server unavailable. Monitoring continues under the last received policy; uploads are queued within the storage limit."
+		a.message = "Server unavailable. Capture continues under the last received policy; uploads are queued within the storage limit."
 		a.Unlock()
 		return
 	}
@@ -218,12 +236,15 @@ func (a *Agent) refresh(parent context.Context) {
 	result.Policy = result.Policy.bounded()
 	a.Lock()
 	a.lastContact = time.Now()
-	a.message = "Connected. Monitoring follows your organization's policy."
+	a.message = "Connected. Capture follows your organization's policy."
 	a.Unlock()
 	if result.Policy != session.Policy {
 		session.Policy = result.Policy
 		a.useSession(*session)
-		a.persist(*session)
+		if err := a.persist(*session); err != nil {
+			os.Remove(filepath.Join(a.root, "session.bin"))
+			a.localLog("credentials.not_saved", "", err.Error())
+		}
 	}
 }
 func (a *Agent) status(showUser bool) map[string]any {
@@ -233,24 +254,58 @@ func (a *Agent) status(showUser bool) map[string]any {
 	result := map[string]any{"device_identifier": a.id, "device_name": a.config.DeviceName, "server_url": a.config.ServerURL, "tracking": a.tracking, "message": a.message, "notice": a.policy.Notice, "policy": a.policy, "pending": count, "queue_mb": float64(bytes/1024) / 1024, "last_contact": a.lastContact, "upload_message": a.uploadMessage, "capture_message": a.captureMessage, "user": nil}
 	if showUser && a.session != nil {
 		result["user"] = a.session.User
+		if a.preview != nil && a.preview.UserID == a.session.User.ID {
+			result["screenshot_preview"] = a.preview.metadata()
+		}
 	}
 	if a.lastContact.IsZero() {
 		result["last_contact"] = nil
 	}
+	presence := presenceFor(a.policy)
+	result["presence"] = presence
+	if a.tracking && presence.State != "active" {
+		result["capture_message"] = "Screenshots paused: " + presence.State
+		result["message"] = "Capture connected; screenshots paused while idle or locked."
+	}
+	result["idle_threshold_seconds"] = a.policy.bounded().IdleThresholdSeconds
+	result["video_recording"] = a.videoRecording
+	result["video_message"] = a.videoMessage
 	result["failed_uploads"] = a.queue.failedCount()
 	return result
 }
 func (a *Agent) activity(ctx context.Context, session Session) {
+	var previous Activity
+	var previousAt time.Time
 	for {
 		if ctx.Err() != nil {
 			return
 		}
+		if presenceFor(session.Policy).State != "active" {
+			previousAt = time.Time{}
+			if !waitFor(ctx, time.Second) {
+				return
+			}
+			continue
+		}
 		sample, err := readForeground(ctx, session.Policy.BrowserURLs)
-		if err == nil && ctx.Err() == nil {
-			event := Event{ID: uuid(), CapturedAt: time.Now().UTC(), App: truncate(sample.App, 160), Title: truncate(sample.Title, 1000), URL: truncate(sample.URL, 2048)}
+		if err == nil && ctx.Err() == nil && presenceFor(session.Policy).State == "active" {
+			now := time.Now().UTC()
+			seconds, switches := 0, 0
+			if !previousAt.IsZero() && now.Sub(previousAt) <= time.Duration(session.Policy.ActivitySeconds*2)*time.Second {
+				if previous.WindowID != sample.WindowID || previous.App != sample.App {
+					switches = 1
+				} else if previous.Title == sample.Title {
+					seconds = int(now.Sub(previousAt).Seconds())
+				}
+			}
+			previous, previousAt = sample, now
+			event := Event{DurationSeconds: seconds, SampleIntervalSeconds: session.Policy.ActivitySeconds, AppSwitches: &switches, ID: uuid(), CapturedAt: now, App: truncate(sample.App, 160), Title: truncate(sample.Title, 1000), URL: truncate(sample.URL, 2048)}
 			if err := a.queue.add(Job{Event: event, Kind: "activity", UserID: session.User.ID}, session.Policy.QueueMB); err != nil {
 				a.setUploadMessage(err.Error())
 			}
+		}
+		if err != nil {
+			previousAt = time.Time{}
 		}
 		if !waitFor(ctx, time.Duration(session.Policy.ActivitySeconds)*time.Second) {
 			return
@@ -274,15 +329,25 @@ func (a *Agent) capture(ctx context.Context, session Session) {
 		if !waitFor(ctx, time.Until(target)) {
 			return
 		}
-		if time.Now().Before(start.Add(period)) {
+		if time.Now().Before(start.Add(period)) && presenceFor(session.Policy).State == "active" {
 			id := uuid()
 			file := id + ".png"
 			path := filepath.Join(a.root, "payloads", file)
 			captured := time.Now().UTC()
-			err := captureScreenContext(ctx, path)
+			capturePresence := presenceFor(session.Policy)
+			if capturePresence.State != "active" {
+				start = start.Add(period)
+				continue
+			}
+			err := whileActive(ctx, func() Presence { return presenceFor(session.Policy) }, time.Second, func(activeCtx context.Context) error { return captureScreenContext(activeCtx, path) })
 			if ctx.Err() != nil {
 				os.Remove(path)
 				return
+			}
+			if err == nil && presenceFor(session.Policy).State != "active" {
+				os.Remove(path)
+				start = start.Add(period)
+				continue
 			}
 			if err == nil {
 				info, statErr := os.Stat(path)
@@ -297,7 +362,7 @@ func (a *Agent) capture(ctx context.Context, session Session) {
 						return
 					}
 					event := Event{ID: id, CapturedAt: captured, App: truncate(sample.App, 160), Title: truncate(sample.Title, 1000), URL: truncate(sample.URL, 2048)}
-					err = a.queue.add(Job{Event: event, Kind: "screenshot", UserID: session.User.ID, File: file, Bytes: info.Size()}, session.Policy.QueueMB)
+					err = a.queue.add(Job{Event: event, Kind: "screenshot", UserID: session.User.ID, File: file, Bytes: info.Size(), CaptureState: capturePresence.State, IdleSeconds: &capturePresence.IdleSeconds, IdleThresholdSeconds: session.Policy.IdleThresholdSeconds, AgentVersion: "1.5.5"}, session.Policy.QueueMB)
 				}
 			}
 			a.Lock()
@@ -331,46 +396,78 @@ func (a *Agent) uploads(ctx context.Context, session Session) {
 			if ctx.Err() != nil {
 				return
 			}
+			if job.Kind == "video" || job.Kind == "anomaly" {
+				a.uploadOptional(ctx, session, job)
+				continue
+			}
 			if job.Kind == "activity" {
 				activities = append(activities, job)
 				continue
 			}
-			err := a.client.upload(ctx, session.Token, a.root, job)
+			if presenceFor(session.Policy).State != "active" {
+				a.setUploadMessage("Screenshot uploads paused while idle or locked.")
+				continue
+			}
+			a.showUploadPreview(session, job)
+			err := whileActive(ctx, func() Presence { return presenceFor(session.Policy) }, time.Second, func(activeCtx context.Context) error { return a.client.upload(activeCtx, session.Token, a.root, job) })
 			if ctx.Err() != nil {
 				return
 			}
 			a.finishJob(job, err)
 		}
 		if len(activities) > 0 && ctx.Err() == nil {
-			events := make([]Event, 0, len(activities))
-			for _, job := range activities {
-				events = append(events, job.Event)
-			}
-			var result struct {
-				IDs []string `json:"accepted_ids"`
-			}
-			err := a.client.request(ctx, "/api/agent/activity", session.Token, map[string]any{"events": events}, &result)
-			if ctx.Err() != nil {
-				return
-			}
-			acknowledged := map[string]bool{}
-			for _, id := range result.IDs {
-				acknowledged[id] = true
-			}
-			for _, job := range activities {
-				jobErr := err
-				if jobErr == nil && !acknowledged[job.ID] {
-					jobErr = errors.New("server did not confirm this event")
-				}
-				a.finishJob(job, jobErr)
-			}
+			a.uploadActivities(ctx, session, activities)
 		}
 		if !waitFor(ctx, 3*time.Second) {
 			return
 		}
 	}
 }
+func (a *Agent) uploadActivities(ctx context.Context, session Session, jobs []Job) {
+	if ctx.Err() != nil || len(jobs) == 0 {
+		return
+	}
+	events := make([]Event, 0, len(jobs))
+	for _, job := range jobs {
+		events = append(events, job.Event)
+	}
+	var result struct {
+		IDs []string `json:"accepted_ids"`
+	}
+	err := a.client.request(ctx, "/api/agent/activity", session.Token, map[string]any{"events": events}, &result)
+	if ctx.Err() != nil {
+		return
+	}
+	var apiErr *APIError
+	if len(jobs) > 1 && errors.As(err, &apiErr) && (apiErr.Code == 400 || apiErr.Code == 413 || apiErr.Code == 422) {
+		// Isolate malformed records rather than rejecting healthy neighbors in the batch.
+		middle := len(jobs) / 2
+		a.uploadActivities(ctx, session, jobs[:middle])
+		a.uploadActivities(ctx, session, jobs[middle:])
+		return
+	}
+	acknowledged := map[string]bool{}
+	for _, id := range result.IDs {
+		acknowledged[id] = true
+	}
+	for _, job := range jobs {
+		jobErr := err
+		if jobErr == nil && !acknowledged[job.ID] {
+			jobErr = errors.New("server did not confirm this event")
+		}
+		a.finishJob(job, jobErr)
+	}
+}
 func (a *Agent) finishJob(job Job, err error) {
+	a.Lock()
+	if a.preview != nil && a.preview.ID == job.ID {
+		if err == nil {
+			a.preview.State = "Uploaded — server confirmed receipt"
+		} else {
+			a.preview.State = "Upload unsuccessful — retained in local queue"
+		}
+	}
+	a.Unlock()
 	if err != nil {
 		var apiErr *APIError
 		var queueErr error

@@ -21,7 +21,7 @@ class User extends Authenticatable
 
     protected function casts(): array
     {
-        return ['email_verified_at' => 'datetime', 'password' => 'hashed', 'enabled' => 'boolean'];
+        return ['email_verified_at' => 'datetime', 'password' => 'hashed', 'enabled' => 'boolean', 'weekly_summary_enabled' => 'boolean'];
     }
 
     public function devices(): HasMany

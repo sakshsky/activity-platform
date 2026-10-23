@@ -24,7 +24,7 @@ class GenerateThumbnail implements ShouldQueue
     public function handle(Vault $vault): void
     {
         $shot = Screenshot::find($this->screenshotId);
-        if (! $shot || $shot->thumbnail_path) {
+        if (! $shot || $shot->deleted_at || $shot->thumbnail_path) {
             return;
         }
         $source = $vault->get($shot->path, $shot->storage);
@@ -50,7 +50,7 @@ class GenerateThumbnail implements ShouldQueue
         // Each attempt owns its file; only the first conditional publication wins.
         $path = 'thumbnails/'.$shot->device_id.'/'.$shot->id.'-'.Str::uuid().'.jpg';
         $vault->put($path, $bytes, $shot->storage);
-        if (! Screenshot::whereKey($shot->id)->whereNull('thumbnail_path')->update(['thumbnail_path' => $path])) {
+        if (! Screenshot::whereKey($shot->id)->whereNull('thumbnail_path')->whereNull('deleted_at')->update(['thumbnail_path' => $path])) {
             $vault->delete($path, $shot->storage);
         }
     }

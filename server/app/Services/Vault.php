@@ -21,6 +21,9 @@ class Vault
             return;
         }
         $temporary = tempnam(sys_get_temp_dir(), 'tracker-upload-');
+        if ($temporary === false) {
+            throw new RuntimeException('Cannot stage storage upload.');
+        }
         try {
             if (file_put_contents($temporary, $bytes) === false) {
                 throw new RuntimeException('Cannot stage storage upload.');
@@ -92,7 +95,11 @@ class Vault
         $quote = static fn (string $value): string => '"'.str_replace(['\\', '"', "\n", "\r"], ['\\\\', '\"', '\n', '\r'], $value).'"';
         $config = 'url = '.$quote(rtrim($base, '/').'/'.$path)."\n".'user = '.$quote(config('tracker.ftps_username').':'.config('tracker.ftps_password'))."\n";
         $process = new Process([config('tracker.curl_binary'), '--disable', '--config', '-', '--silent', '--show-error', '--fail', '--globoff', '--ssl-reqd', '--connect-timeout', '10', '--max-time', '40', ...$extra], null, null, $config, 45);
-        $process->run();
+        try {
+            $process->run();
+        } catch (\Throwable) {
+            throw new RuntimeException('FTPS storage request could not be completed.');
+        }
         if (! $process->isSuccessful()) {
             throw new RuntimeException('FTPS storage request failed. Check server credentials, certificates, folder permissions and connectivity.');
         }

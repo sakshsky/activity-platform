@@ -2,6 +2,7 @@
 
 namespace Tests\Feature;
 
+use App\Http\Controllers\AgentController;
 use App\Jobs\GenerateThumbnail;
 use App\Models\ActivityLog;
 use App\Models\AuditLog;
@@ -10,12 +11,16 @@ use App\Models\MonitoringPolicy;
 use App\Models\Screenshot;
 use App\Models\User;
 use App\Services\Vault;
+use Database\Seeders\DatabaseSeeder;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Laravel\Sanctum\PersonalAccessToken;
+use Symfony\Component\HttpKernel\Exception\HttpException;
 use Tests\TestCase;
 
 class TrackerTest extends TestCase
@@ -35,6 +40,85 @@ class TrackerTest extends TestCase
         $user ??= User::factory()->create(['role' => 'employee']);
 
         return $this->postJson('/api/agent/login', ['email' => $user->email, 'password' => 'password', 'device_identifier' => (string) Str::uuid(), 'device_name' => 'Test PC', 'os' => 'windows', 'notice_accepted' => true])->assertOk()->json();
+    }
+
+    public function test_policy_seeding_does_not_use_a_generated_insert_id(): void
+    {
+        MonitoringPolicy::query()->delete();
+        $connection = DB::connection();
+        $original = $connection->getPostProcessor();
+        $processor = \Mockery::mock(get_class($original))->makePartial();
+        $processor->shouldReceive('processInsertGetId')->andReturnUsing(function ($query, $sql, $values, $sequence) {
+            $query->getConnection()->insert($sql, $values);
+
+            return 0; // MySQL returns zero for this non-auto-increment primary key.
+        });
+        $connection->setPostProcessor($processor);
+        try {
+            $this->seed(DatabaseSeeder::class);
+            $policy = MonitoringPolicy::current();
+            $this->assertSame(1, $policy->getKey());
+            $this->assertSame(120, $policy->screenshot_interval_seconds);
+            $this->seed(DatabaseSeeder::class);
+            $this->assertDatabaseCount('monitoring_policies', 1);
+        } finally {
+            $connection->setPostProcessor($original);
+        }
+    }
+
+    public function test_case_variant_duplicate_email_returns_validation_error(): void
+    {
+        $admin = User::factory()->create(['role' => 'super_admin']);
+        User::factory()->create(['email' => 'employee@example.test']);
+        $this->actingAs($admin)->postJson('/api/admin/users', ['name' => 'Duplicate', 'email' => 'EMPLOYEE@EXAMPLE.TEST', 'role' => 'employee', 'password' => 'LocalTestPassword!'])->assertUnprocessable();
+        $this->assertDatabaseCount('users', 2);
+    }
+
+    public function test_admin_login_normalizes_email_case(): void
+    {
+        User::factory()->create(['email' => 'admin@example.test', 'role' => 'super_admin']);
+        $this->postJson('/api/admin/login', ['email' => 'ADMIN@EXAMPLE.TEST', 'password' => 'password'])->assertOk();
+    }
+
+    public function test_upload_rechecks_pause_after_middleware_snapshot(): void
+    {
+        $login = $this->enroll();
+        $request = $this->staleDeviceRequest($login);
+        $request->replace(['events' => [['event_id' => (string) Str::uuid(), 'captured_at' => now()->toIso8601String(), 'app_name' => 'test.exe']]]);
+        Device::whereKey($login['device']['id'])->update(['paused' => true]);
+        try {
+            app(AgentController::class)->activity($request);
+            $this->fail('A paused device was accepted using stale middleware state.');
+        } catch (HttpException $error) {
+            $this->assertSame(409, $error->getStatusCode());
+        }
+        $this->assertDatabaseCount('activity_logs', 0);
+    }
+
+    public function test_old_logout_cannot_clear_a_replacement_device_token(): void
+    {
+        $login = $this->enroll();
+        $request = $this->staleDeviceRequest($login);
+        $replacement = $request->user()->createToken('replacement', ['device:collect'], now()->addHour());
+        Device::whereKey($login['device']['id'])->update(['token_id' => $replacement->accessToken->id]);
+        try {
+            app(AgentController::class)->logout($request);
+            $this->fail('Stale logout cleared a replacement token.');
+        } catch (HttpException $error) {
+            $this->assertSame(403, $error->getStatusCode());
+        }
+        $this->assertDatabaseHas('devices', ['id' => $login['device']['id'], 'token_id' => $replacement->accessToken->id]);
+        $this->assertDatabaseHas('personal_access_tokens', ['id' => $replacement->accessToken->id]);
+    }
+
+    private function staleDeviceRequest(array $login): Request
+    {
+        $token = PersonalAccessToken::findToken($login['token']);
+        $request = Request::create('/api/agent/activity', 'POST');
+        $request->setUserResolver(fn () => $token->tokenable->withAccessToken($token));
+        $request->attributes->set('device', Device::findOrFail($login['device']['id']));
+
+        return $request;
     }
 
     public function test_expired_device_token_is_rejected_without_global_expiration(): void
@@ -146,9 +230,12 @@ class TrackerTest extends TestCase
         $body['file'] = UploadedFile::fake()->createWithContent('again.png', $bytes);
         $this->postJson('/api/agent/screenshots', $body)->assertOk();
         $this->assertDatabaseCount('screenshots', 1);
-        Queue::assertPushed(GenerateThumbnail::class, 1);
+        Queue::assertPushed(GenerateThumbnail::class, 2);
         (new GenerateThumbnail($shot->id))->handle(app(Vault::class));
         $this->assertNotNull($shot->fresh()->thumbnail_path);
+        $body['file'] = UploadedFile::fake()->createWithContent('finished.png', $bytes);
+        $this->postJson('/api/agent/screenshots', $body)->assertOk();
+        Queue::assertPushed(GenerateThumbnail::class, 2);
         $this->getJson('/api/admin/screenshots/'.$shot->id.'/file')->assertUnauthorized();
     }
 

@@ -41,13 +41,13 @@ func openQueue(root string) (*Queue, error) {
 			return nil, err
 		}
 		var job Job
-		if json.Unmarshal(bytes, &job) != nil || !validID(job.ID) || job.UserID == "" || job.CapturedAt.IsZero() || job.Attempts < 0 || job.Attempts > 100 || entry.Name() != job.ID+".json" || (job.Kind != "activity" && job.Kind != "screenshot") || (job.Kind == "screenshot" && job.File != job.ID+".png") || (job.Kind == "activity" && job.File != "") {
+		if json.Unmarshal(bytes, &job) != nil || !validID(job.ID) || job.UserID == "" || job.CapturedAt.IsZero() || job.Attempts < 0 || job.Attempts > 100 || entry.Name() != job.ID+".json" || (job.Kind != "activity" && job.Kind != "screenshot" && job.Kind != "video" && job.Kind != "anomaly") || (job.Kind == "screenshot" && job.File != job.ID+".png") || ((job.Kind == "activity" || job.Kind == "anomaly") && job.File != "") || (job.Kind == "video" && job.File != job.ID+".mp4") || (job.Kind == "anomaly" && job.Anomaly == nil) {
 			if err := q.quarantine(entry.Name()); err != nil {
 				return nil, err
 			}
 			continue
 		}
-		if job.Kind == "screenshot" {
+		if job.Kind == "screenshot" || job.Kind == "video" {
 			info, err := os.Lstat(filepath.Join(root, "payloads", job.File))
 			if err != nil || !info.Mode().IsRegular() {
 				if err := q.quarantine(entry.Name()); err != nil {
@@ -55,9 +55,9 @@ func openQueue(root string) (*Queue, error) {
 				}
 				continue
 			}
-			job.Bytes = info.Size() + int64(len(bytes))
+			job.Bytes = info.Size() + int64(len(bytes)) + 256
 		} else {
-			job.Bytes = int64(len(bytes))
+			job.Bytes = int64(len(bytes)) + 256
 		}
 		q.jobs[job.ID] = job
 		q.used += job.Bytes
@@ -128,12 +128,14 @@ func (q *Queue) ack(id string) error {
 	if !ok {
 		return nil
 	}
-	// Remove the manifest first; a crash leaves only an orphan, not a broken job.
+	// Keep the manifest and accounting until payload cleanup succeeds.
+	if job.File != "" {
+		if err := os.Remove(filepath.Join(q.root, "payloads", job.File)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	if err := os.Remove(filepath.Join(q.root, "outbox", id+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
-	}
-	if job.File != "" {
-		os.Remove(filepath.Join(q.root, "payloads", job.File))
 	}
 	delete(q.jobs, id)
 	q.used -= job.Bytes

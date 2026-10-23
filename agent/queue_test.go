@@ -14,6 +14,86 @@ import (
 func queuedEvent() Job {
 	return Job{Event: Event{ID: uuid(), CapturedAt: time.Now().UTC(), App: "synthetic.exe"}, Kind: "activity", UserID: "employee-one"}
 }
+
+func TestBadActivityDoesNotRejectHealthyBatchNeighbors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Events []Event `json:"events"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		ids := []string{}
+		for _, event := range body.Events {
+			if event.App == "" {
+				w.WriteHeader(422)
+				json.NewEncoder(w).Encode(map[string]string{"message": "invalid event"})
+				return
+			}
+			ids = append(ids, event.ID)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"accepted_ids": ids})
+	}))
+	defer server.Close()
+	a, err := newAgent(Config{ServerURL: server.URL}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, bad := queuedEvent(), queuedEvent()
+	bad.App = ""
+	for _, job := range []Job{good, bad} {
+		if err := a.queue.add(job, 50); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.uploadActivities(context.Background(), Session{Token: "test"}, []Job{good, bad})
+	if count, _ := a.queue.stats(); count != 1 || a.queue.failedCount() != 1 {
+		t.Fatal("healthy event was retained or rejected")
+	}
+	loaded, err := openQueue(a.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loaded.jobs[good.ID]; ok {
+		t.Fatal("healthy event remains queued")
+	}
+	if loaded.jobs[bad.ID].Failure == "" {
+		t.Fatal("bad event was not isolated")
+	}
+}
+
+func TestFailedPayloadCleanupRetainsManifestAndAccounting(t *testing.T) {
+	root := t.TempDir()
+	q, err := openQueue(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := queuedEvent()
+	job.Kind = "screenshot"
+	job.File = job.ID + ".png"
+	job.Bytes = 100
+	if err := q.add(job, 50); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(root, "payloads", job.File)
+	if err := os.Mkdir(payload, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(payload, "blocker"), []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, before := q.stats()
+	if q.ack(job.ID) == nil {
+		t.Fatal("failed removal was treated as successful")
+	}
+	count, after := q.stats()
+	if count != 1 || after != before {
+		t.Fatal("failed removal lost queue accounting")
+	}
+	if _, err := os.Stat(filepath.Join(root, "outbox", job.ID+".json")); err != nil {
+		t.Fatal("manifest removed before payload cleanup")
+	}
+}
 func TestQueueSurvivesRestartAndAcknowledgement(t *testing.T) {
 	root := t.TempDir()
 	q, err := openQueue(root)

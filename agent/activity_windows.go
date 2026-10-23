@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -39,11 +40,11 @@ func readForeground(ctx context.Context, wantURLs bool) (Activity, error) {
 	}
 	var title [4096]uint16
 	getWindowText.Call(hwnd, uintptr(unsafe.Pointer(&title[0])), uintptr(len(title)))
-	item := Activity{App: filepath.Base(syscall.UTF16ToString(name[:size])), Title: syscall.UTF16ToString(title[:])}
+	item := Activity{WindowID: hwnd, App: filepath.Base(syscall.UTF16ToString(name[:size])), Title: syscall.UTF16ToString(title[:])}
 	if wantURLs {
 		switch strings.ToLower(item.App) {
 		case "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe":
-			item.URL = readBrowserAddress(ctx, hwnd)
+			item.URL = sampledBrowserAddress(ctx, hwnd)
 			if item.URL == "" {
 				item.URLStatus = "Browser address unavailable"
 			}
@@ -98,3 +99,20 @@ foreach($item in $items) {
     }
 }
 `
+
+var browserSample struct {
+	sync.Mutex
+	last time.Time
+}
+
+// Do not reuse stale addresses: unsampled records have no URL.
+func sampledBrowserAddress(ctx context.Context, hwnd uintptr) string {
+	browserSample.Lock()
+	if time.Since(browserSample.last) < 30*time.Second {
+		browserSample.Unlock()
+		return ""
+	}
+	browserSample.last = time.Now()
+	browserSample.Unlock()
+	return readBrowserAddress(ctx, hwnd)
+}

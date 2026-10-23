@@ -8,7 +8,9 @@ use App\Models\Device;
 use App\Models\MonitoringPolicy;
 use App\Models\Screenshot;
 use App\Models\User;
+use App\Services\Attendance;
 use App\Services\Audit;
+use App\Services\CaptureDeletion;
 use App\Services\Vault;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Eloquent\Builder;
@@ -23,7 +25,7 @@ class AdminController extends Controller
 {
     public function overview(Request $request): JsonResponse
     {
-        Audit::record($request, 'overview.view');
+        // Routine overview polling does not create a read-audit event.
 
         return response()->json(['devices' => Device::count(), 'online' => Device::whereNull('disabled_at')->where('last_seen_at', '>=', now()->subMinutes(2))->count(), 'employees' => User::where('role', 'employee')->where('enabled', true)->count(), 'screenshots_today' => Screenshot::where('captured_at', '>=', now()->startOfDay())->count(), 'recent_devices' => Device::with('user:id,name')->orderByDesc('last_seen_at')->limit(6)->get(), 'apps' => ActivityLog::where('captured_at', '>=', now()->startOfDay())->select('app_name')->selectRaw('COUNT(*) AS samples')->groupBy('app_name')->orderByDesc('samples')->limit(6)->get()]);
     }
@@ -42,6 +44,9 @@ class AdminController extends Controller
 
     public function createUser(Request $request): JsonResponse
     {
+        if (is_string($request->input('email'))) {
+            $request->merge(['email' => strtolower(trim($request->input('email')))]);
+        }
         $data = $request->validate(['name' => 'required|string|max:120', 'email' => 'required|email|max:255|unique:users,email', 'role' => ['required', Rule::in(['super_admin', 'reviewer', 'employee'])], 'password' => ['required', 'string', Password::min(12)]]);
         $data['email'] = strtolower($data['email']);
         $user = User::create($data);
@@ -58,6 +63,7 @@ class AdminController extends Controller
             $locked = User::whereKey($user->id)->lockForUpdate()->firstOrFail();
             $locked->update($data);
             if (! $data['enabled']) {
+                DB::table('employee_sessions')->where('user_id', $locked->id)->whereNull('ended_at')->update(['ended_at' => DB::raw('last_seen_at'), 'end_reason' => 'account_disabled', 'eligible' => false]);
                 $locked->tokens()->delete();
                 $locked->devices()->update(['disabled_at' => now(), 'token_id' => null]);
                 DB::table('sessions')->where('user_id', $locked->id)->delete();
@@ -91,6 +97,10 @@ class AdminController extends Controller
             if (array_key_exists('paused', $data)) {
                 $locked->paused = $data['paused'];
             }
+            DB::table('employee_sessions')->where('device_id', $locked->id)->whereNull('ended_at')->update(['eligible' => false]);
+            if ($locked->disabled_at) {
+                Attendance::close($locked, 'device_disabled');
+            }
             $locked->save();
         });
         Audit::record($request, 'device.updated', 'device', $device->id, $data);
@@ -105,12 +115,15 @@ class AdminController extends Controller
 
     public function savePolicy(Request $request): JsonResponse
     {
-        $data = $request->validate(['monitoring_enabled' => 'required|boolean', 'screenshot_interval_seconds' => 'required|integer|min:30|max:3600', 'activity_interval_seconds' => 'required|integer|min:5|max:300', 'browser_urls' => 'required|boolean', 'retention_days' => 'required|integer|min:1|max:365', 'audit_retention_days' => 'required|integer|min:30|max:3650', 'offline_queue_max_mb' => 'required|integer|min:50|max:10240', 'offline_retention_days' => 'required|integer|min:1|max:30', 'notice' => 'required|string|min:20|max:4000']);
+        $data = $request->validate(['deletion_policy' => 'sometimes|in:neutral', 'video_enabled' => 'sometimes|boolean', 'anomaly_enabled' => 'sometimes|boolean', 'video_interval_seconds' => 'sometimes|integer|min:60|max:3600', 'video_clip_seconds' => 'sometimes|integer|min:5|max:30', 'video_retention_days' => 'sometimes|integer|min:1|max:30', 'video_quota_mb' => 'sometimes|integer|min:50|max:10240', 'idle_threshold_seconds' => 'sometimes|required|integer|min:30|max:600', 'idle_alert_minutes' => 'sometimes|required|integer|min:0|max:120', 'monitoring_enabled' => 'required|boolean', 'screenshot_interval_seconds' => 'required|integer|min:30|max:3600', 'activity_interval_seconds' => 'required|integer|min:5|max:300', 'browser_urls' => 'required|boolean', 'retention_days' => 'required|integer|min:1|max:365', 'audit_retention_days' => 'required|integer|min:30|max:3650', 'offline_queue_max_mb' => 'required|integer|min:50|max:10240', 'offline_retention_days' => 'required|integer|min:1|max:30', 'notice' => 'required|string|min:20|max:4000']);
         $policy = DB::transaction(function () use ($data): MonitoringPolicy {
             $policy = MonitoringPolicy::whereKey(MonitoringPolicy::current()->id)->lockForUpdate()->firstOrFail();
             $policy->fill($data);
             $policy->version++;
             $policy->save();
+            if (! $policy->monitoring_enabled) {
+                DB::table('employee_sessions')->whereNull('ended_at')->update(['eligible' => false]);
+            }
 
             return $policy;
         });
@@ -140,7 +153,7 @@ class AdminController extends Controller
         Audit::record($request, 'screenshots.list', null, null, $request->only('user_id', 'device_id', 'from', 'to', 'app'));
 
         return response()->json($query->paginate(24)->through(fn (Screenshot $shot) => [
-            'id' => $shot->id, 'captured_at' => $shot->captured_at, 'app_name' => $shot->app_name, 'window_title' => $shot->window_title,
+            ...$shot->metadata(), 'employee_id' => $shot->device->user_id, 'url' => $shot->url, 'id' => $shot->id, 'captured_at' => $shot->captured_at, 'app_name' => $shot->app_name, 'window_title' => $shot->window_title,
             'device_name' => $shot->device->name, 'user_name' => $shot->device->user->name, 'image_url' => route('screenshot.file', $shot, false),
             'thumbnail_url' => route('screenshot.thumbnail', $shot, false),
         ]));
@@ -151,13 +164,13 @@ class AdminController extends Controller
         $thumb = $request->routeIs('screenshot.thumbnail') && $screenshot->thumbnail_path;
         Audit::record($request, $thumb ? 'screenshot.thumbnail_viewed' : 'screenshot.viewed', 'screenshot', $screenshot->id, ['device_id' => $screenshot->device_id]);
         try {
-            $bytes = $vault->get($thumb ? $screenshot->thumbnail_path : $screenshot->path, $screenshot->storage);
+            [$bytes,$mime] = app(CaptureDeletion::class)->content($screenshot->id, (bool) $thumb, $vault);
         } catch (\Throwable $error) {
             report($error);
             abort(503, 'Screenshot storage is unavailable.');
         }
 
-        return response($bytes, 200, ['Content-Type' => $thumb ? 'image/jpeg' : 'image/png', 'Cache-Control' => 'private, no-store', 'X-Content-Type-Options' => 'nosniff', 'Content-Disposition' => 'inline; filename="screenshot.'.($thumb ? 'jpg' : 'png').'"']);
+        return response($bytes, 200, ['Content-Type' => $mime, 'Cache-Control' => 'private, no-store', 'X-Content-Type-Options' => 'nosniff', 'Content-Disposition' => 'inline; filename="screenshot.'.($thumb ? 'jpg' : 'png').'"']);
     }
 
     public function activity(Request $request): JsonResponse
@@ -165,7 +178,7 @@ class AdminController extends Controller
         Audit::record($request, 'activity.list', null, null, $request->only('user_id', 'device_id', 'from', 'to', 'app'));
 
         return response()->json($this->filtered(ActivityLog::query(), $request)->with('device.user')->orderByDesc('captured_at')->orderBy('id')->paginate(50)->through(fn (ActivityLog $event) => [
-            'id' => $event->id, 'captured_at' => $event->captured_at, 'app_name' => $event->app_name, 'window_title' => $event->window_title, 'url' => $event->url,
+            'duration_seconds' => $event->duration_seconds, 'app_switches' => $event->app_switches, 'id' => $event->id, 'captured_at' => $event->captured_at, 'app_name' => $event->app_name, 'window_title' => $event->window_title, 'url' => $event->url,
             'device_name' => $event->device->name, 'user_name' => $event->device->user->name,
         ]));
     }
@@ -178,9 +191,9 @@ class AdminController extends Controller
         if (! $request->filled('to')) {
             $request->merge(['to' => $request->input('from')]);
         }
-        $query = $this->filtered(ActivityLog::query(), $request)->with('device.user')->orderBy('captured_at');
+        $query = $this->filtered(ActivityLog::query(), $request)->with('device.user')->orderBy('captured_at')->orderBy('id');
         abort_if(CarbonImmutable::parse($request->input('from'))->diffInDays(CarbonImmutable::parse($request->input('to'))) > 31, 422, 'Export at most 31 days at a time.');
-        abort_if($query->count() > 100000, 422, 'Narrow this export to fewer than 100,000 records.');
+        abort_if((clone $query)->offset(100000)->limit(1)->get(['activity_logs.id'])->isNotEmpty(), 422, 'Narrow this export to fewer than 100,000 records.');
         Audit::record($request, 'activity.exported', null, null, $request->only('user_id', 'device_id', 'from', 'to', 'app'));
 
         return response()->streamDownload(function () use ($query): void {

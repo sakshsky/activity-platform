@@ -38,7 +38,7 @@ type trayMessage struct {
 	Private        uint32
 }
 
-func runTray(ctx context.Context, address string, tracking func() bool) {
+func runTray(ctx context.Context, address string, tracking func() string) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	api := syscall.NewLazyDLL("user32.dll")
@@ -54,10 +54,7 @@ func runTray(ctx context.Context, address string, tracking func() bool) {
 	notify.Callback = 0x8001
 	notify.Icon = icon
 	setTip := func() {
-		text := "Activity: signed out / paused — click to view"
-		if tracking() {
-			text = "Activity: monitoring active — click to view"
-		}
+		text := "Activity: " + tracking()
 		notify.Tip = [128]uint16{}
 		value, _ := syscall.UTF16FromString(text)
 		copy(notify.Tip[:], value)

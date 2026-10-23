@@ -37,15 +37,15 @@ func main() {
 		path = filepath.Join(root, path)
 	}
 	data, err := os.ReadFile(path)
-	if err != nil {
-		log.Fatal("Copy agent-config.example.json to agent-config.json and set your server URL.")
+	if err != nil && !os.IsNotExist(err) {
+		log.Fatal("Cannot read agent configuration: ", err)
 	}
 	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
+	if len(data) > 0 && json.Unmarshal(data, &config) != nil {
 		log.Fatal("Invalid agent configuration")
 	}
 	config.ServerURL = strings.TrimRight(config.ServerURL, "/")
-	if !secureServer(config.ServerURL) {
+	if config.ServerURL != "" && !secureServer(config.ServerURL) {
 		log.Fatal("Server URL must use HTTPS or an HTTP loopback IP.")
 	}
 	if config.DeviceName == "" {
@@ -66,6 +66,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	agent.configPath = path
 	origin := "http://" + listener.Addr().String()
 	uiToken := uuid() + uuid()
 	mux := agentHandler(agent, origin, uiToken)
@@ -73,7 +74,17 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 	go agent.background(ctx)
-	go runTray(ctx, origin+"/agent", func() bool { agent.Lock(); defer agent.Unlock(); return agent.tracking })
+	go runTray(ctx, origin+"/agent", func() string {
+		agent.Lock()
+		defer agent.Unlock()
+		if agent.videoRecording {
+			return "RECORDING SCREEN VIDEO — click to view"
+		}
+		if agent.tracking {
+			return "Capture active — click to view"
+		}
+		return "Signed out / paused — click to view"
+	})
 	go func() {
 		<-ctx.Done()
 		agent.Lock()
@@ -83,7 +94,7 @@ func main() {
 		agent.Unlock()
 		server.Close()
 	}()
-	fmt.Printf("Activity agent running at %s/agent\nMonitoring is visible and follows the server policy after login.\nKeep this console open. Press Ctrl+C to exit.\n", origin)
+	fmt.Printf("Activity agent running at %s/agent\nCapture is visible and follows the server policy after login.\nKeep this console open. Press Ctrl+C to exit.\n", origin)
 	if !*noBrowser {
 		openBrowser(origin + "/agent")
 	}
@@ -123,9 +134,51 @@ func agentHandler(agent *Agent, origin, uiToken string) http.Handler {
 		}
 		return true
 	}
+	mux.HandleFunc("/local/system-check", func(w http.ResponseWriter, r *http.Request) {
+		if !authenticated(r) {
+			http.Error(w, "Login required", 401)
+			return
+		}
+		if !writeAllowed(w, r) {
+			return
+		}
+		agent.systemChecks(w, r)
+	})
 	mux.HandleFunc("/local/status", func(w http.ResponseWriter, r *http.Request) {
+		if !authenticated(r) {
+			http.Error(w, "Login required", 401)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(agent.status(authenticated(r)))
+	})
+	for _, path := range []string{"/local/my-screenshot/delete", "/local/modules-consent", "/local/videos", "/local/my-video", "/local/anomalies", "/local/anomaly-context", "/local/performance", "/local/task-submit", "/local/work-context", "/local/portal", "/local/profile", "/local/leave", "/local/leave-cancel", "/local/my-data", "/local/my-screenshot"} {
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			if !authenticated(r) {
+				http.Error(w, "Login required", 401)
+				return
+			}
+			if r.URL.Path == "/local/videos" || r.URL.Path == "/local/my-video" || r.URL.Path == "/local/anomalies" || r.URL.Path == "/local/performance" || r.URL.Path == "/local/portal" || r.URL.Path == "/local/my-data" || r.URL.Path == "/local/my-screenshot" {
+				if r.Method != "GET" {
+					http.Error(w, "Method not allowed", 405)
+					return
+				}
+			} else if !writeAllowed(w, r) {
+				return
+			}
+			if r.URL.Path == "/local/my-screenshot" || r.URL.Path == "/local/my-video" {
+				agent.serverScreenshot(w, r)
+				return
+			}
+			agent.portal(w, r)
+		})
+	}
+	mux.HandleFunc("/local/screenshot-preview", func(w http.ResponseWriter, r *http.Request) {
+		if !authenticated(r) {
+			http.Error(w, "Login required", http.StatusUnauthorized)
+			return
+		}
+		agent.servePreview(w, r)
 	})
 	mux.HandleFunc("/local/login", func(w http.ResponseWriter, r *http.Request) {
 		if !writeAllowed(w, r) {
@@ -150,6 +203,23 @@ func agentHandler(agent *Agent, origin, uiToken string) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]bool{"success": true})
 	})
+	mux.HandleFunc("/local/config", func(w http.ResponseWriter, r *http.Request) {
+		if !writeAllowed(w, r) {
+			return
+		}
+		var input Config
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&input) != nil {
+			http.Error(w, "Invalid settings", 400)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := agent.configure(r.Context(), input); err != nil {
+			w.WriteHeader(422)
+			json.NewEncoder(w).Encode(map[string]string{"message": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	})
 	mux.HandleFunc("/local/logout", func(w http.ResponseWriter, r *http.Request) {
 		if !writeAllowed(w, r) {
 			return
@@ -159,7 +229,8 @@ func agentHandler(agent *Agent, origin, uiToken string) http.Handler {
 			return
 		}
 		agent.logout()
-		http.SetCookie(w, &http.Cookie{Name: "activity_agent", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+		// Browser access is separate from employee authentication; keep setup/status usable.
+		http.SetCookie(w, &http.Cookie{Name: "activity_agent", Value: uiToken, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, "{}")
 	})
@@ -180,6 +251,9 @@ func agentHandler(agent *Agent, origin, uiToken string) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// Bootstrap browser access before login so a new installation can show setup.
+		// Employee records still require an authenticated server session.
+		http.SetCookie(w, &http.Cookie{Name: "activity_agent", Value: uiToken, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
 		w.Write(data)
 	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

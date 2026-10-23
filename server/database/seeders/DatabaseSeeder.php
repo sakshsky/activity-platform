@@ -10,5 +10,6 @@ class DatabaseSeeder extends Seeder
     public function run(): void
     {
         MonitoringPolicy::current();
+        $this->call(AppRuleSeeder::class);
     }
 }
